@@ -25,11 +25,13 @@ if sys.platform == 'win32':
 
 
 class ThesisChecker:
-    def __init__(self, data_dir="原始数据", output_dir="查重结果", threshold=0.75):
+    def __init__(self, data_dir="原始数据", resubmit_dir="二次提交", output_dir="查重结果", threshold=0.75):
         self.data_dir = Path(data_dir)
+        self.resubmit_dir = Path(resubmit_dir)
         self.output_dir = Path(output_dir)
         self.threshold = threshold
         self.output_dir.mkdir(exist_ok=True)
+        self.resubmit_dir.mkdir(exist_ok=True)  # 确保二次提交文件夹存在
 
     def extract_class_from_filename(self, filename):
         """从文件名中提取班级名称，班级名必须包含数字"""
@@ -62,11 +64,35 @@ class ThesisChecker:
 
         return ''  # 未找到班级名时返回空字符串
 
+    def get_excel_files(self, directory):
+        """获取指定目录中的所有Excel文件"""
+        excel_files = list(directory.glob("*.xls")) + list(directory.glob("*.xlsx"))
+        return excel_files if excel_files else []
+
+    def has_resubmit_data(self):
+        """检查是否有二次提交数据"""
+        return len(self.get_excel_files(self.resubmit_dir)) > 0
+
     def read_excel_files(self):
-        """读取原始数据文件夹中的所有Excel文件"""
-        excel_files = list(self.data_dir.glob("*.xls")) + list(self.data_dir.glob("*.xlsx"))
+        """读取Excel文件 - 优先使用二次提交文件夹"""
+        print("\n正在读取数据文件...")
+
+        # 优先读取二次提交文件夹
+        if self.has_resubmit_data():
+            print("✓ 检测到二次提交数据，将优先使用二次提交文件夹")
+            primary_dir = self.resubmit_dir
+            secondary_dir = self.data_dir
+            use_resubmit = True
+        else:
+            print("✓ 二次提交文件夹为空，使用原始数据文件夹")
+            primary_dir = self.data_dir
+            secondary_dir = None
+            use_resubmit = False
+
+        # 读取主目录文件
+        excel_files = self.get_excel_files(primary_dir)
         if not excel_files:
-            raise FileNotFoundError(f"在 {self.data_dir} 文件夹中未找到Excel文件")
+            raise FileNotFoundError(f"在 {primary_dir} 文件夹中未找到Excel文件")
 
         all_data = []
         for file in excel_files:
@@ -76,7 +102,7 @@ class ThesisChecker:
                 for header_row in [None, 0, 1, 2]:
                     try:
                         df = pd.read_excel(file, header=header_row)
-                        # 检查是否包含关键列（同时检查课题名称和学生姓名）
+                        # 检查是否包含关键列
                         cols = df.columns.tolist()
                         has_title = any('课题' in str(c) or '题目' in str(c) or '标题' in str(c) for c in cols)
                         has_student = any(c == '学生姓名' for c in cols)
@@ -88,19 +114,146 @@ class ThesisChecker:
                 if df is not None and len(df) > 0:
                     df['source_file'] = file.name
                     df['source_class'] = self.extract_class_from_filename(file.name)
+                    df['is_resubmit'] = use_resubmit  # 标记是否为二次提交数据
                     all_data.append(df)
                     class_info = f" [班级: {df['source_class'].iloc[0]}]" if df['source_class'].iloc[0] else ""
-                    print(f"✓ 已读取: {file.name}{class_info} ({len(df)} 条记录)")
+                    source_tag = "[二次提交]" if use_resubmit else "[原始数据]"
+                    print(f"✓ 已读取: {file.name}{class_info} {source_tag} ({len(df)} 条记录)")
             except Exception as e:
                 print(f"✗ 读取失败: {file.name} - {e}")
 
         if not all_data:
             raise ValueError("未能成功读取任何Excel文件")
 
+        # 如果有二次提交数据，也读取原始数据作为参考
+        if use_resubmit and secondary_dir:
+            print("\n正在读取原始数据文件夹作为参考...")
+            secondary_files = self.get_excel_files(secondary_dir)
+            for file in secondary_files:
+                try:
+                    # 跳过已经在二次提交中处理过的文件（同名文件）
+                    if any(d['source_file'].iloc[0] == file.name for d in all_data if len(d) > 0):
+                        continue
+
+                    df = None
+                    for header_row in [None, 0, 1, 2]:
+                        try:
+                            df = pd.read_excel(file, header=header_row)
+                            cols = df.columns.tolist()
+                            has_title = any('课题' in str(c) or '题目' in str(c) or '标题' in str(c) for c in cols)
+                            has_student = any(c == '学生姓名' for c in cols)
+                            if has_title and has_student:
+                                break
+                        except:
+                            continue
+
+                    if df is not None and len(df) > 0:
+                        df['source_file'] = file.name
+                        df['source_class'] = self.extract_class_from_filename(file.name)
+                        df['is_resubmit'] = False  # 标记为原始数据
+                        all_data.append(df)
+                        class_info = f" [班级: {df['source_class'].iloc[0]}]" if df['source_class'].iloc[0] else ""
+                        print(f"✓ 已读取: {file.name}{class_info} [原始数据参考] ({len(df)} 条记录)")
+                except Exception as e:
+                    print(f"✗ 读取失败: {file.name} - {e}")
+
         # 合并所有数据
         combined_df = pd.concat(all_data, ignore_index=True)
-        print(f"\n总共读取 {len(combined_df)} 条记录\n")
+
+        # 如果有二次提交数据，进行学生级别的数据合并
+        if use_resubmit:
+            print("\n正在进行数据合并（按学生去重）...")
+            combined_df = self.merge_student_data(combined_df)
+
+        # 显示统计信息
+        resubmit_count = sum(1 for d in all_data if d['is_resubmit'].iloc[0] if len(d) > 0)
+        original_count = len(all_data) - resubmit_count
+        print(f"\n数据读取完成:")
+        print(f"  - 总记录数: {len(combined_df)}")
+        if use_resubmit:
+            print(f"  - 二次提交文件: {resubmit_count} 个")
+            print(f"  - 原始数据文件: {original_count} 个（参考）")
+            print(f"  ✓ 已按学生合并，以二次提交的课题名称为准")
+        else:
+            print(f"  - 原始数据文件: {len(all_data)} 个")
+
+        print()
         return combined_df
+
+    def merge_student_data(self, df):
+        """合并同一学生的多条记录，以二次提交为准，从原始数据补充缺失信息"""
+        # 确保有学生姓名列
+        if '学生姓名' not in df.columns:
+            return df
+
+        # 查找学生姓名列的实际列名（可能已被重命名）
+        student_col = None
+        for col in df.columns:
+            if '学生' in str(col) and '姓名' in str(col):
+                student_col = col
+                break
+
+        if student_col is None:
+            # 尝试直接匹配
+            if '学生姓名' in df.columns:
+                student_col = '学生姓名'
+            else:
+                return df
+
+        # 按学生姓名分组
+        grouped = df.groupby(student_col)
+        merged_indices = []
+        duplicate_count = 0
+
+        for student_name, group in grouped:
+            if len(group) == 1:
+                # 只有一条记录，直接保留
+                merged_indices.append(group.index[0])
+            else:
+                # 多条记录，需要合并
+                duplicate_count += 1
+                # 优先使用 is_resubmit=True 的记录
+                resubmit_records = group[group['is_resubmit'] == True]
+                original_records = group[group['is_resubmit'] == False]
+
+                if len(resubmit_records) > 0:
+                    # 以二次提交记录为基础
+                    base_idx = resubmit_records.index[0]
+                    # 如果有多条二次提交记录，使用第一条
+                    # 从原始数据补充缺失信息（课题名称除外）
+                    if len(original_records) > 0:
+                        # 就地修改基础记录
+                        for col in df.columns:
+                            # 跳过课题名称列 - 始终使用二次提交的课题名称
+                            if '课题' in str(col) or '题目' in str(col) or '标题' in str(col):
+                                continue
+
+                            base_val = df.at[base_idx, col]
+                            # 判断基础值是否为空
+                            is_empty = (
+                                pd.isna(base_val) or
+                                str(base_val).strip() == '' or
+                                str(base_val).lower() == 'nan'
+                            )
+                            if is_empty:
+                                # 从原始数据获取值
+                                orig_idx = original_records.index[0]
+                                orig_val = df.at[orig_idx, col]
+                                # 确保补充的值不为空
+                                if not pd.isna(orig_val) and str(orig_val).strip() != '' and str(orig_val).lower() != 'nan':
+                                    df.at[base_idx, col] = orig_val
+                    merged_indices.append(base_idx)
+                else:
+                    # 没有二次提交记录（理论上不应该发生），使用第一条原始记录
+                    merged_indices.append(group.index[0])
+
+        # 筛选合并后的记录
+        merged_df = df.loc[merged_indices].reset_index(drop=True)
+
+        if duplicate_count > 0:
+            print(f"  ✓ 合并了 {duplicate_count} 个学生的重复记录")
+
+        return merged_df
 
     def is_valid_title(self, title):
         """判断题目是否有效（非空、非待定等无意义内容）"""
@@ -504,7 +657,20 @@ class ThesisChecker:
 
             all_data_display['第二指导教师'] = all_data_display['第二指导教师'].apply(fill_second_teacher)
 
-            # 5. 添加数据有效性标注列
+            # 5. 指导教师工号：去除小数点及后续数字
+            def clean_teacher_id(value):
+                """去除教师工号末尾的小数点及后续数字"""
+                if pd.isna(value) or str(value).strip() == '' or str(value) == 'nan':
+                    return value
+                value_str = str(value)
+                # 查找小数点位置，去除小数点及后面的内容
+                if '.' in value_str:
+                    value_str = value_str.split('.')[0]
+                return value_str
+
+            all_data_display['指导教师工号'] = all_data_display['指导教师工号'].apply(clean_teacher_id)
+
+            # 6. 添加数据有效性标注列
             def mark_validity(title):
                 """标记题目是否有效"""
                 if self.is_valid_title(title):
@@ -523,6 +689,39 @@ class ThesisChecker:
                 '学生姓名', '学生学号', '学生组织', '来源', '模板类型', '第二指导教师',
                 '班级(文件名)', '来源文件', '数据状态'
             ]
+
+            # 按班级和学号排序
+            # 首先尝试按学生学号（数字）排序，如果学号无法转换为数字则按字符串排序
+            def safe_student_id_sort(id_value):
+                """安全地提取学号中的数字部分用于排序"""
+                try:
+                    # 尝试提取学号中的数字部分
+                    id_str = str(id_value)
+                    # 提取所有数字
+                    import re
+                    numbers = re.findall(r'\d+', id_str)
+                    if numbers:
+                        # 返回第一个数字序列作为排序键
+                        return int(numbers[0])
+                    return 0
+                except:
+                    return 0
+
+            # 创建排序列
+            all_data_display['_sort_class'] = all_data_display['班级(文件名)'].fillna('')
+            all_data_display['_sort_id'] = all_data_display['学生学号'].apply(safe_student_id_sort)
+
+            # 先按班级排序，再按学号排序
+            all_data_display = all_data_display.sort_values(
+                by=['_sort_class', '_sort_id'],
+                ascending=[True, True]
+            )
+
+            # 删除临时排序列
+            all_data_display = all_data_display.drop(columns=['_sort_class', '_sort_id'])
+
+            # 重新生成序号
+            all_data_display['序号'] = range(1, len(all_data_display) + 1)
 
             all_data_display.to_excel(writer, sheet_name='全部数据', index=False)
 
@@ -583,6 +782,7 @@ def main():
     """主函数"""
     checker = ThesisChecker(
         data_dir="原始数据",
+        resubmit_dir="二次提交",
         output_dir="查重结果",
         threshold=0.75  # 可调整相似度阈值
     )
