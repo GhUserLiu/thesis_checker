@@ -15,6 +15,8 @@ import pandas as pd
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 import jieba
+from openpyxl import load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
 # 设置输出编码为UTF-8
 if sys.platform == 'win32':
@@ -142,55 +144,66 @@ class ThesisChecker:
 
     def normalize_columns(self, df):
         """标准化列名，提取所需信息"""
+        # 原始文件的完整列名（11列）
+        original_columns = [
+            '课题名称', '可选范围', '所属专业', '指导教师姓名', '指导教师工号',
+            '学生姓名', '学生学号', '学生组织', '来源', '模板类型', '第二指导教师'
+        ]
+
+        # 查找各列（使用模糊匹配）
+        column_mapping = {}
+
         # 查找课题名称列
-        title_col = None
         for col in df.columns:
-            if '课题' in str(col):
-                title_col = col
+            if '课题' in str(col) or '题目' in str(col) or '标题' in str(col):
+                column_mapping['课题名称'] = col
                 break
 
-        # 查找学生姓名列（精确匹配"学生姓名"）
-        student_col = None
+        # 查找其他列（精确匹配）
         for col in df.columns:
-            if col == '学生姓名':
-                student_col = col
-                break
+            col_str = str(col)
+            if col_str == '可选范围':
+                column_mapping['可选范围'] = col
+            elif col_str == '所属专业':
+                column_mapping['所属专业'] = col
+            elif col_str == '指导教师姓名':
+                column_mapping['指导教师姓名'] = col
+            elif col_str == '指导教师工号':
+                column_mapping['指导教师工号'] = col
+            elif col_str == '学生姓名':
+                column_mapping['学生姓名'] = col
+            elif col_str == '学生学号':
+                column_mapping['学生学号'] = col
+            elif col_str == '学生组织':
+                column_mapping['学生组织'] = col
+            elif col_str == '来源':
+                column_mapping['来源'] = col
+            elif col_str == '模板类型':
+                column_mapping['模板类型'] = col
+            elif col_str == '第二指导教师':
+                column_mapping['第二指导教师'] = col
 
-        # 查找指导教师列（精确匹配"指导教师姓名"）
-        teacher_col = None
-        for col in df.columns:
-            if col == '指导教师姓名':
-                teacher_col = col
-                break
-
-        # 查找班级/专业列（精确匹配"所属专业"）
-        class_col = None
-        for col in df.columns:
-            if col == '所属专业':
-                class_col = col
-                break
-
-        # 创建标准化的数据
+        # 创建标准化的数据，包含所有原始列
         result = pd.DataFrame()
-        result['课题名称'] = df[title_col].astype(str) if title_col else ''
-        result['学生'] = df[student_col].astype(str) if student_col else '未知'
-        result['导师'] = df[teacher_col].astype(str) if teacher_col else '未知'
 
-        # 班级信息：优先使用从文件名提取的班级，其次使用Excel中的"所属专业"列
+        # 填充所有列（如果找不到则填充空值）
+        for orig_col in original_columns:
+            if orig_col in column_mapping:
+                result[orig_col] = df[column_mapping[orig_col]].astype(str)
+            else:
+                result[orig_col] = ''
+
+        # 添加辅助列
         if 'source_class' in df.columns:
             # 使用从文件名提取的班级
-            result['班级'] = df['source_class'].astype(str)
-        elif class_col:
-            # 使用Excel中的"所属专业"列
-            result['班级'] = df[class_col].astype(str)
+            result['文件提取的班级'] = df['source_class'].astype(str)
         else:
-            # 都没有则为空
-            result['班级'] = ''
+            result['文件提取的班级'] = ''
 
         result['来源文件'] = df['source_file'].astype(str) if 'source_file' in df.columns else ''
         result['原始索引'] = df.index
 
-        # 使用新的有效性判断方法过滤无效记录
+        # 使用课题名称列进行有效性判断
         valid_mask = result['课题名称'].apply(self.is_valid_title)
         valid_df = result[valid_mask].reset_index(drop=True)
         invalid_df = result[~valid_mask].reset_index(drop=True)
@@ -220,20 +233,126 @@ class ThesisChecker:
             for j in range(i + 1, n):
                 similarity = similarity_matrix[i][j]
                 if similarity >= self.threshold:
+                    # 优先使用文件提取的班级，其次使用所属专业
+                    class_a = df.iloc[i]['文件提取的班级'] if df.iloc[i]['文件提取的班级'] else df.iloc[i]['所属专业']
+                    class_b = df.iloc[j]['文件提取的班级'] if df.iloc[j]['文件提取的班级'] else df.iloc[j]['所属专业']
+
                     similar_pairs.append({
                         '题目A': df.iloc[i]['课题名称'],
                         '题目B': df.iloc[j]['课题名称'],
-                        '学生A': df.iloc[i]['学生'],
-                        '学生B': df.iloc[j]['学生'],
-                        '导师A': df.iloc[i]['导师'],
-                        '导师B': df.iloc[j]['导师'],
-                        '班级A': df.iloc[i]['班级'],
-                        '班级B': df.iloc[j]['班级'],
+                        '学生A': df.iloc[i]['学生姓名'],
+                        '学生B': df.iloc[j]['学生姓名'],
+                        '导师A': df.iloc[i]['指导教师姓名'],
+                        '导师B': df.iloc[j]['指导教师姓名'],
+                        '班级A': class_a,
+                        '班级B': class_b,
                         '相似度': f"{similarity:.2%}",
                         '相似度数值': similarity
                     })
 
         return sorted(similar_pairs, key=lambda x: x['相似度数值'], reverse=True)
+
+    def format_excel_sheet(self, ws, header_row=True):
+        """格式化Excel工作表"""
+        # 定义边框样式
+        thin_border = Border(
+            left=Side(style='thin', color='000000'),
+            right=Side(style='thin', color='000000'),
+            top=Side(style='thin', color='000000'),
+            bottom=Side(style='thin', color='000000')
+        )
+
+        # 定义表头样式
+        header_font = Font(bold=True, color='FFFFFF', size=11)
+        header_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
+        header_alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+
+        # 定义数据单元格样式
+        cell_alignment = Alignment(horizontal='left', vertical='center', wrap_text=False)
+
+        # 应用格式到所有行
+        for row_idx, row in enumerate(ws.iter_rows(), 1):
+            for cell in row:
+                # 应用边框
+                cell.border = thin_border
+
+                # 第一行是表头
+                if row_idx == 1 and header_row:
+                    cell.font = header_font
+                    cell.fill = header_fill
+                    cell.alignment = header_alignment
+                else:
+                    cell.alignment = cell_alignment
+                    # 自动调整行高
+                    if row_idx > 1:
+                        try:
+                            value = str(cell.value) if cell.value else ""
+                            # 根据内容长度估算行高（每行约15个字符）
+                            lines = max(1, (len(value) + 20) // 25)
+                            ws.row_dimensions[row_idx].height = max(15, lines * 15)
+                        except:
+                            ws.row_dimensions[row_idx].height = 15
+
+        # 自动调整列宽
+        for column in ws.columns:
+            max_length = 0
+            column_letter = column[0].column_letter
+
+            for cell in column:
+                try:
+                    if cell.value:
+                        # 计算字符串长度（中文字符按2个长度计算）
+                        value = str(cell.value)
+                        length = sum(2 if '\u4e00' <= char <= '\u9fff' else 1 for char in value)
+                        if length > max_length:
+                            max_length = length
+                except:
+                    pass
+
+            # 设置列宽，限制在合理范围内
+            adjusted_width = min(max_length + 2, 50)  # 最大宽度50
+            if adjusted_width < 12:
+                adjusted_width = 12  # 最小宽度12
+            ws.column_dimensions[column_letter].width = adjusted_width
+
+    def highlight_similar_rows(self, ws):
+        """为相似题目工作表的高相似度行添加颜色标记"""
+        # 定义颜色填充
+        high_fill = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')  # 红色
+        medium_fill = PatternFill(start_color='FFE6CC', end_color='FFE6CC', fill_type='solid')  # 橙色
+
+        # 从第2行开始（第1行是表头）
+        for row_idx, row in enumerate(ws.iter_rows(min_row=2), 2):
+            # 相似度在最后一列
+            similarity_cell = row[-1]
+            if similarity_cell.value:
+                try:
+                    # 提取相似度数值（去掉百分号）
+                    sim_str = str(similarity_cell.value).replace('%', '')
+                    sim_value = float(sim_str) / 100
+
+                    # 根据相似度设置背景色
+                    if sim_value >= 0.85:
+                        for cell in row:
+                            cell.fill = high_fill
+                    elif sim_value >= 0.80:
+                        for cell in row:
+                            cell.fill = medium_fill
+                except:
+                    pass
+
+    def highlight_invalid_rows(self, ws):
+        """为全部数据工作表的无效题目行添加颜色标记"""
+        # 定义无效数据的灰色背景
+        invalid_fill = PatternFill(start_color='E0E0E0', end_color='E0E0E0', fill_type='solid')  # 浅灰色
+
+        # 从第2行开始（第1行是表头）
+        for row_idx, row in enumerate(ws.iter_rows(min_row=2), 2):
+            # 检查最后一列的"数据状态"
+            status_cell = row[-1]
+            if status_cell.value and str(status_cell.value) == '无效':
+                for cell in row:
+                    cell.fill = invalid_fill
 
     def run(self):
         """执行查重"""
@@ -271,12 +390,113 @@ class ThesisChecker:
 
             # 工作表2：无效题目记录
             if len(invalid_df) > 0:
-                invalid_display = invalid_df[['课题名称', '学生', '导师', '班级', '来源文件']].copy()
-                invalid_display.columns = ['课题名称', '学生', '导师', '班级', '来源文件']
+                # 选择主要列显示
+                invalid_display = invalid_df[['课题名称', '学生姓名', '指导教师姓名', '所属专业', '文件提取的班级', '来源文件']].copy()
+                # 合并班级列（优先显示文件提取的班级）
+                invalid_display['班级'] = invalid_display['文件提取的班级'].fillna(invalid_display['所属专业'])
+                invalid_display = invalid_display[['课题名称', '学生姓名', '指导教师姓名', '班级', '来源文件']]
+                invalid_display.columns = ['课题名称', '学生姓名', '指导教师姓名', '班级', '来源文件']
                 invalid_display.to_excel(writer, sheet_name='无效题目', index=False)
             else:
-                empty_invalid_df = pd.DataFrame(columns=['课题名称', '学生', '导师', '班级', '来源文件'])
+                empty_invalid_df = pd.DataFrame(columns=['课题名称', '学生姓名', '指导教师姓名', '班级', '来源文件'])
                 empty_invalid_df.to_excel(writer, sheet_name='无效题目', index=False)
+
+            # 工作表3：所有原始数据（合并所有列，包括有效和无效）
+            # 合并有效和无效数据
+            all_data_with_invalid = pd.concat([valid_df, invalid_df], ignore_index=True)
+
+            # 选择所有原始数据列
+            all_columns = [
+                '课题名称', '可选范围', '所属专业', '指导教师姓名', '指导教师工号',
+                '学生姓名', '学生学号', '学生组织', '来源', '模板类型', '第二指导教师',
+                '文件提取的班级', '来源文件'
+            ]
+
+            # 确保所有列都存在
+            all_data_display = all_data_with_invalid.copy()
+            for col in all_columns:
+                if col not in all_data_display.columns:
+                    all_data_display[col] = ''
+
+            all_data_display = all_data_display[all_columns]
+
+            # 数据规范化
+            import random
+            random.seed(42)  # 固定随机种子，确保可重复
+
+            # 1. 学生组织统一为"汽车工程学院"
+            all_data_display['学生组织'] = '汽车工程学院'
+
+            # 2. 来源为空则随机填写"学生自选"或"教师指定"
+            def fill_source(value):
+                if pd.isna(value) or str(value).strip() == '' or str(value) == 'nan':
+                    return random.choice(['学生自选', '教师指定'])
+                return value
+
+            all_data_display['来源'] = all_data_display['来源'].apply(fill_source)
+
+            # 3. 模板类型统一为"理科"
+            all_data_display['模板类型'] = '理科'
+
+            # 4. 第二指导教师为空则填写"无"
+            def fill_second_teacher(value):
+                if pd.isna(value) or str(value).strip() == '' or str(value) == 'nan':
+                    return '无'
+                return value
+
+            all_data_display['第二指导教师'] = all_data_display['第二指导教师'].apply(fill_second_teacher)
+
+            # 5. 添加数据有效性标注列
+            def mark_validity(title):
+                """标记题目是否有效"""
+                if self.is_valid_title(title):
+                    return '有效'
+                else:
+                    return '无效'
+
+            all_data_display.insert(len(all_data_display.columns), '数据状态', all_data_display['课题名称'].apply(mark_validity))
+
+            # 添加序号列
+            all_data_display.insert(0, '序号', range(1, len(all_data_display) + 1))
+
+            # 重命名列以更清晰
+            all_data_display.columns = [
+                '序号', '课题名称', '可选范围', '所属专业', '指导教师姓名', '指导教师工号',
+                '学生姓名', '学生学号', '学生组织', '来源', '模板类型', '第二指导教师',
+                '班级(文件名)', '来源文件', '数据状态'
+            ]
+
+            all_data_display.to_excel(writer, sheet_name='全部数据', index=False)
+
+        # 格式化Excel文件
+        print("正在优化Excel格式...")
+        wb = load_workbook(output_file)
+
+        # 格式化工作表1：相似题目
+        if '相似题目' in wb.sheetnames:
+            ws_similar = wb['相似题目']
+            self.format_excel_sheet(ws_similar)
+            self.highlight_similar_rows(ws_similar)
+            # 冻结首行
+            ws_similar.freeze_panes = 'A2'
+
+        # 格式化工作表2：无效题目
+        if '无效题目' in wb.sheetnames:
+            ws_invalid = wb['无效题目']
+            self.format_excel_sheet(ws_invalid)
+            # 冻结首行
+            ws_invalid.freeze_panes = 'A2'
+
+        # 格式化工作表3：全部数据
+        if '全部数据' in wb.sheetnames:
+            ws_all = wb['全部数据']
+            self.format_excel_sheet(ws_all)
+            self.highlight_invalid_rows(ws_all)  # 标记无效题目行
+            # 冻结首行
+            ws_all.freeze_panes = 'A2'
+
+        # 保存格式化后的文件
+        wb.save(output_file)
 
         if similar_pairs:
             print(f"\n发现 {len(similar_pairs)} 对相似题目 (阈值: {self.threshold:.0%})")
