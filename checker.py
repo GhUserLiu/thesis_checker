@@ -142,6 +142,51 @@ class ThesisChecker:
 
         return True
 
+    def remove_all_spaces(self, value):
+        """去除字符串中的所有空格和空白字符，包括不间断空格"""
+        if pd.isna(value):
+            return value
+        result = str(value)
+        # 去除各种空白字符
+        result = result.replace(' ', '')      # 普通空格
+        result = result.replace('\t', '')     # 制表符
+        result = result.replace('\n', '')     # 换行符
+        result = result.replace('\r', '')     # 回车符
+        result = result.replace('\xa0', '')   # 不间断空格 (NBSP)
+        result = result.replace('\u3000', '') # 中文全角空格
+        result = result.replace('\u200b', '') # 零宽空格
+        result = result.replace('\u200c', '') # 零宽非连接符
+        result = result.replace('\u200d', '') # 零宽连接符
+        result = result.replace('\ufeff', '') # 零宽非断空格 (BOM)
+        return result
+
+    def normalize_major(self, major_value, source_class):
+        """规范化所属专业字段，只返回两个标准值之一"""
+        major_str = str(major_value).strip()
+
+        # 如果已经是标准值，直接返回
+        if major_str in ['汽车服务工程技术', '新能源汽车工程技术']:
+            return major_str
+
+        # 根据从文件名提取的班级信息来判断
+        if source_class:
+            if '新能' in source_class or '新能源' in source_class:
+                return '新能源汽车工程技术'
+            elif '汽服' in source_class or '汽车服务' in source_class:
+                return '汽车服务工程技术'
+
+        # 根据原始专业名称中的关键词判断
+        if any(keyword in major_str for keyword in ['新能源', '新能', 'NEV']):
+            return '新能源汽车工程技术'
+        elif any(keyword in major_str for keyword in ['汽车服务', '汽服', '汽车工程']):
+            return '汽车服务工程技术'
+        elif '测试' in major_str:
+            # 测试数据默认归为汽车服务工程技术
+            return '汽车服务工程技术'
+        else:
+            # 默认值
+            return '汽车服务工程技术'
+
     def normalize_columns(self, df):
         """标准化列名，提取所需信息"""
         # 原始文件的完整列名（11列）
@@ -193,17 +238,28 @@ class ThesisChecker:
             else:
                 result[orig_col] = ''
 
+        # 立即去除课题名称中的所有空格（在所有处理之前）
+        result['课题名称'] = result['课题名称'].apply(self.remove_all_spaces)
+
         # 添加辅助列
+        source_class = ''
         if 'source_class' in df.columns:
             # 使用从文件名提取的班级
-            result['文件提取的班级'] = df['source_class'].astype(str)
+            source_class = df['source_class'].astype(str)
+            result['文件提取的班级'] = source_class
         else:
             result['文件提取的班级'] = ''
 
         result['来源文件'] = df['source_file'].astype(str) if 'source_file' in df.columns else ''
         result['原始索引'] = df.index
 
-        # 使用课题名称列进行有效性判断
+        # 规范化所属专业字段为两个标准值之一
+        result['所属专业'] = result.apply(
+            lambda row: self.normalize_major(row['所属专业'], row['文件提取的班级']),
+            axis=1
+        )
+
+        # 使用课题名称列进行有效性判断（此时课题名称已无空格）
         valid_mask = result['课题名称'].apply(self.is_valid_title)
         valid_df = result[valid_mask].reset_index(drop=True)
         invalid_df = result[~valid_mask].reset_index(drop=True)
@@ -423,6 +479,8 @@ class ThesisChecker:
             # 数据规范化
             import random
             random.seed(42)  # 固定随机种子，确保可重复
+
+            # 注意：课题名称中的空格已在 normalize_columns 阶段去除
 
             # 1. 学生组织统一为"汽车工程学院"
             all_data_display['学生组织'] = '汽车工程学院'
