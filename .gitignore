@@ -1,6 +1,12 @@
 # 数据文件
 原始数据/
+二次提交/
 查重结果/
+
+# 打包文件
+build/
+dist/
+*.spec
 
 # Python
 __pycache__/
@@ -21,11 +27,13 @@ ENV/
 # 系统
 .DS_Store
 Thumbs.db
+nul
 
 # 日志和临时文件
 *.log
 *.tmp
 *.temp
+~$*
 
 # 数据库文件
 *.db
