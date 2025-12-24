@@ -181,36 +181,39 @@ class ThesisChecker:
         return combined_df
 
     def merge_student_data(self, df):
-        """合并同一学生的多条记录，以二次提交为准，从原始数据补充缺失信息"""
-        # 确保有学生姓名列
+        """合并同一学生的多条记录，以二次提交为准，从原始数据补充缺失信息
+
+        判断同一学生的标准：学生姓名 AND 学号相同
+        """
+        # 确保有学生姓名和学生学号列
         if '学生姓名' not in df.columns:
             return df
 
-        # 查找学生姓名列的实际列名（可能已被重命名）
-        student_col = None
+        # 查找学生学号列
+        student_id_col = None
         for col in df.columns:
-            if '学生' in str(col) and '姓名' in str(col):
-                student_col = col
+            if '学号' in str(col):
+                student_id_col = col
                 break
 
-        if student_col is None:
-            # 尝试直接匹配
-            if '学生姓名' in df.columns:
-                student_col = '学生姓名'
-            else:
-                return df
+        # 创建唯一标识符（姓名 + 学号）用于判断是否为同一学生
+        # 如果没有学号列，则只使用姓名
+        if student_id_col is not None and student_id_col in df.columns:
+            df['_student_key'] = df['学生姓名'].astype(str) + '|||' + df[student_id_col].astype(str)
+        else:
+            df['_student_key'] = df['学生姓名'].astype(str)
 
-        # 按学生姓名分组
-        grouped = df.groupby(student_col)
+        # 按唯一标识符分组
+        grouped = df.groupby('_student_key')
         merged_indices = []
         duplicate_count = 0
 
-        for student_name, group in grouped:
+        for student_key, group in grouped:
             if len(group) == 1:
                 # 只有一条记录，直接保留
                 merged_indices.append(group.index[0])
             else:
-                # 多条记录，需要合并
+                # 多条记录，需要合并（同一学生在二次提交和原始数据中都存在）
                 duplicate_count += 1
                 # 优先使用 is_resubmit=True 的记录
                 resubmit_records = group[group['is_resubmit'] == True]
@@ -226,6 +229,9 @@ class ThesisChecker:
                         for col in df.columns:
                             # 跳过课题名称列 - 始终使用二次提交的课题名称
                             if '课题' in str(col) or '题目' in str(col) or '标题' in str(col):
+                                continue
+                            # 跳过临时列
+                            if col == '_student_key':
                                 continue
 
                             base_val = df.at[base_idx, col]
@@ -246,6 +252,10 @@ class ThesisChecker:
                 else:
                     # 没有二次提交记录（理论上不应该发生），使用第一条原始记录
                     merged_indices.append(group.index[0])
+
+        # 删除临时列
+        if '_student_key' in df.columns:
+            df = df.drop(columns=['_student_key'])
 
         # 筛选合并后的记录
         merged_df = df.loc[merged_indices].reset_index(drop=True)
