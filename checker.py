@@ -573,6 +573,40 @@ class ThesisChecker:
                 for cell in row:
                     cell.fill = invalid_fill
 
+    def highlight_all_data_rows(self, ws, similar_pairs, all_data_display):
+        """为全部数据工作表的相似题目和无效题目添加颜色标记"""
+        # 定义颜色填充
+        invalid_fill = PatternFill(start_color='E0E0E0', end_color='E0E0E0', fill_type='solid')  # 浅灰色 - 无效题目
+        similar_fill = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')  # 黄色 - 相似题目
+
+        # 收集所有相似题目的课题名称
+        similar_titles = set()
+        for pair in similar_pairs:
+            similar_titles.add(str(pair['题目A']))
+            similar_titles.add(str(pair['题目B']))
+
+        # 从第2行开始（第1行是表头）
+        for row_idx, row in enumerate(ws.iter_rows(min_row=2), 2):
+            # 获取该行的课题名称（第2列，索引为1）
+            title_cell = row[1]  # 序号是第0列，课题名称是第1列
+
+            # 优先标记无效题目（灰色）
+            status_cell = row[-1]  # 最后一列是数据状态
+            is_invalid = status_cell.value and str(status_cell.value) == '无效'
+
+            # 检查是否为相似题目
+            is_similar = title_cell.value and str(title_cell.value) in similar_titles
+
+            # 应用颜色
+            if is_invalid:
+                # 无效题目 - 灰色
+                for cell in row:
+                    cell.fill = invalid_fill
+            elif is_similar:
+                # 相似题目 - 黄色
+                for cell in row:
+                    cell.fill = similar_fill
+
     def run(self):
         """执行查重"""
         print("=" * 60)
@@ -758,7 +792,8 @@ class ThesisChecker:
         if '全部数据' in wb.sheetnames:
             ws_all = wb['全部数据']
             self.format_excel_sheet(ws_all)
-            self.highlight_invalid_rows(ws_all)  # 标记无效题目行
+            # 标记相似题目行和无效题目行
+            self.highlight_all_data_rows(ws_all, similar_pairs, all_data_display)
             # 冻结首行
             ws_all.freeze_panes = 'A2'
 
