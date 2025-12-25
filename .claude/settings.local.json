@@ -13,7 +13,10 @@
       "Bash(ping:*)",
       "Bash(git add:*)",
       "Bash(git commit:*)",
-      "Bash(git push:*)"
+      "Bash(git push:*)",
+      "Bash(pyinstaller:*)",
+      "Bash(if not exist:*)",
+      "Bash(mkdir:*)"
     ]
   }
 }

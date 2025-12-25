@@ -374,9 +374,9 @@ class ThesisChecker:
                 column_mapping['可选范围'] = col
             elif col_str == '所属专业':
                 column_mapping['所属专业'] = col
-            elif col_str == '指导教师姓名':
+            elif col_str == '指导教师姓名' or col_str == '指导教师':
                 column_mapping['指导教师姓名'] = col
-            elif col_str == '指导教师工号':
+            elif col_str == '指导教师工号' or col_str == '教师工号':
                 column_mapping['指导教师工号'] = col
             elif col_str == '学生姓名':
                 column_mapping['学生姓名'] = col
@@ -612,6 +612,19 @@ class ThesisChecker:
         print("=" * 60)
         print("论文选题查重系统")
         print("=" * 60)
+
+        # 检查并创建数据文件夹
+        if not self.data_dir.exists():
+            self.data_dir.mkdir(parents=True, exist_ok=True)
+            print("\n提示：已自动创建「原始数据」文件夹")
+            print("请将待检测的 Excel 文件放入「原始数据」文件夹后，再运行程序")
+            return
+
+        if not self.resubmit_dir.exists():
+            self.resubmit_dir.mkdir(parents=True, exist_ok=True)
+
+        if not self.output_dir.exists():
+            self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # 1. 读取数据
         df = self.read_excel_files()
