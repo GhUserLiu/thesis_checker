@@ -16,7 +16,13 @@
       "Bash(git push:*)",
       "Bash(pyinstaller:*)",
       "Bash(if not exist:*)",
-      "Bash(mkdir:*)"
+      "Bash(mkdir:*)",
+      "Bash(rm:*)",
+      "Bash(conda:*)",
+      "Bash(echo:*)",
+      "Bash(grep:*)",
+      "Bash(iconv:*)",
+      "Bash(cat:*)"
     ]
   }
 }

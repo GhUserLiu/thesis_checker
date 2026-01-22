@@ -18,6 +18,20 @@ import jieba
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 
+# 导入配置和工具模块
+from config import (
+    SIMILARITY_THRESHOLD, CSV_ENCODING, CSV_ENCODING_ERRORS,
+    EXCEL_FONT_SIZE, HEADER_FONT_SIZE,
+    COLOR_HEADER_BG, COLOR_HEADER_FONT,
+    COLOR_HIGH_SIMILARITY, COLOR_MEDIUM_SIMILARITY,
+    COLOR_INVALID_ROW, COLOR_SIMILAR_CELL,
+    DEFAULT_ORGANIZATION, DEFAULT_TEMPLATE_TYPE,
+    DEFAULT_SECOND_TEACHER, RANDOM_SEED
+)
+from utils import (
+    DataCleaner, Validator, FileHelper, Logger
+)
+
 # 设置输出编码为UTF-8
 if sys.platform == 'win32':
     import io
@@ -25,7 +39,7 @@ if sys.platform == 'win32':
 
 
 class ThesisChecker:
-    def __init__(self, data_dir="原始数据", resubmit_dir="二次提交", output_dir="查重结果", threshold=0.75):
+    def __init__(self, data_dir="原始数据", resubmit_dir="二次提交", output_dir="查重结果", threshold=SIMILARITY_THRESHOLD):
         self.data_dir = Path(data_dir)
         self.resubmit_dir = Path(resubmit_dir)
         self.output_dir = Path(output_dir)
@@ -33,159 +47,453 @@ class ThesisChecker:
         self.output_dir.mkdir(exist_ok=True)
         self.resubmit_dir.mkdir(exist_ok=True)  # 确保二次提交文件夹存在
 
-    def extract_class_from_filename(self, filename):
-        """从文件名中提取班级名称，班级名必须包含数字"""
-        # 移除扩展名
-        name = Path(filename).stem
-
-        # 优先匹配标准班级格式：汽服2401B、新能2401D、汽服2401ZB等
-        # 格式：专业简称(汽服/新能) + 年份(2位) + 班号(2位) + 类型(B/D/ZB等)
-        standard_pattern = r'((?:汽服|新能)\d{4}[A-Z]+)'
-        match = re.search(standard_pattern, name)
-        if match:
-            return match.group(1)
-
-        # 备选模式：其他可能的班级名格式（必须包含数字）
-        patterns = [
-            r'(\d+班)',  # 1班, 2021班
-            r'(班\s*\d+)',  # 班1, 班 2021
-            r'([^\d\s]*\d+[^\d\s]*班)',  # 计算机1班, 软工2021班
-            r'(班级[^\d\s]*\d+)',  # 班级1, 班级2021
-            r'(\d+\s*级)',  # 2021级, 2021 级
-        ]
-
-        for pattern in patterns:
-            match = re.search(pattern, name)
-            if match:
-                class_name = match.group(1).strip()
-                # 确保包含数字
-                if re.search(r'\d', class_name):
-                    return class_name
-
-        return ''  # 未找到班级名时返回空字符串
-
     def get_excel_files(self, directory):
-        """获取指定目录中的所有Excel文件"""
-        excel_files = list(directory.glob("*.xls")) + list(directory.glob("*.xlsx"))
+        """获取指定目录中的所有Excel和CSV文件"""
+        excel_files = list(directory.glob("*.xls")) + list(directory.glob("*.xlsx")) + list(directory.glob("*.csv"))
         return excel_files if excel_files else []
 
     def has_resubmit_data(self):
         """检查是否有二次提交数据"""
         return len(self.get_excel_files(self.resubmit_dir)) > 0
 
+    def detect_and_read_simplified_resubmit(self, file):
+        """检测并读取简化的二次提交格式
+
+        简化格式包含：序号、班级、学生姓名、指导教师、论文题目
+        返回：(是否为简化格式, DataFrame或None)
+        """
+        try:
+            # 尝试不同的header位置
+            for header_row in [None, 0, 1, 2]:
+                try:
+                    df = pd.read_excel(file, header=header_row)
+                    cols = df.columns.tolist()
+
+                    # 检测是否为简化格式
+                    # 简化格式的特征：
+                    # 1. 包含"序号"或数字编号列
+                    # 2. 包含"班级"
+                    # 3. 包含"学生姓名"
+                    # 4. 包含"指导教师"或"导师"
+                    # 5. 包含"论文题目"或"课题名称"
+                    has_seq = any('序号' in str(c) or c in range(10) for c in cols)
+                    has_class = any('班级' in str(c) for c in cols)
+                    has_student = any('学生姓名' in str(c) or '姓名' in str(c) for c in cols)
+                    has_teacher = any('指导教师' in str(c) or '导师' in str(c) for c in cols)
+                    has_title = any('论文题目' in str(c) or '课题名称' in str(c) or '题目' in str(c) for c in cols)
+
+                    if has_class and has_student and has_teacher and has_title:
+                        # 确认为简化格式
+                        # 标准化列名
+                        column_mapping = {}
+
+                        # 查找各列（注意顺序很重要，更具体的要放在前面）
+                        for col in df.columns:
+                            col_str = str(col)
+                            if '序号' in col_str or col in range(10):
+                                column_mapping['_序号'] = col
+                            elif '班级' in col_str:
+                                column_mapping['班级'] = col
+                            elif '学生姓名' in col_str:
+                                column_mapping['学生姓名'] = col
+                            elif '姓名' in col_str:  # 简化格式可能只有"姓名"列
+                                column_mapping['学生姓名'] = col
+                            elif '论文题目' in col_str or '课题名称' in col_str:
+                                column_mapping['课题名称'] = col
+                            elif '题目' in col_str:
+                                column_mapping['课题名称'] = col
+                            # 指导教师姓名（必须在最后，优先匹配精确的）
+                            elif col_str == '指导教师' or col_str == '导师':
+                                column_mapping['指导教师姓名'] = col
+                            elif '指导教师' in col_str or '导师' in col_str:
+                                # 只有没有精确匹配时才使用模糊匹配
+                                if '指导教师姓名' not in column_mapping:
+                                    column_mapping['指导教师姓名'] = col
+
+                        # 创建标准化的DataFrame
+                        standardized_df = pd.DataFrame()
+                        for std_col, orig_col in column_mapping.items():
+                            # 不复制下划线开头的临时列到最终DataFrame
+                            if not std_col.startswith('_'):
+                                standardized_df[std_col] = df[orig_col]
+
+                        # 添加必要字段（后续从原始数据补充）
+                        standardized_df['_is_simplified_format'] = True
+                        standardized_df['_original_file'] = file.name
+                        # 将"班级"复制到"所属专业"以便与原始数据匹配
+                        if '班级' in standardized_df.columns:
+                            standardized_df['所属专业'] = standardized_df['班级'].copy()
+
+                        return True, standardized_df
+                except:
+                    continue
+
+            return False, None
+        except:
+            return False, None
+
     def read_excel_files(self):
-        """读取Excel文件 - 优先使用二次提交文件夹"""
+        """读取Excel文件 - 先读取原始数据保存为中间文件,然后用二次提交更新论文题目"""
         print("\n正在读取数据文件...")
 
-        # 优先读取二次提交文件夹
-        if self.has_resubmit_data():
-            print("✓ 检测到二次提交数据，将优先使用二次提交文件夹")
-            primary_dir = self.resubmit_dir
-            secondary_dir = self.data_dir
-            use_resubmit = True
-        else:
-            print("✓ 二次提交文件夹为空，使用原始数据文件夹")
-            primary_dir = self.data_dir
-            secondary_dir = None
-            use_resubmit = False
+        # 创建中间数据文件夹
+        intermediate_dir = Path("中间数据")
+        if intermediate_dir.exists():
+            # 清空中间数据文件夹
+            import shutil
+            shutil.rmtree(intermediate_dir)
+        intermediate_dir.mkdir(parents=True, exist_ok=True)
+        print("✓ 已创建/清空「中间数据」文件夹")
 
-        # 读取主目录文件
-        excel_files = self.get_excel_files(primary_dir)
-        if not excel_files:
-            raise FileNotFoundError(f"在 {primary_dir} 文件夹中未找到Excel文件")
+        # 第一步: 读取所有原始数据文件,建立基础数据库
+        print("\n步骤1: 读取原始数据文件夹,建立基础数据库...")
+        base_files = self.get_excel_files(self.data_dir)
+        if not base_files:
+            raise FileNotFoundError(f"在 {self.data_dir} 文件夹中未找到Excel文件")
 
-        all_data = []
-        for file in excel_files:
+        base_data = []
+        invalid_data = []  # 存储无效数据
+
+        for file in base_files:
             try:
-                # 尝试不同的header位置
                 df = None
-                for header_row in [None, 0, 1, 2]:
+                # 检查是否为CSV文件
+                is_csv = file.suffix.lower() == '.csv'
+
+                if is_csv:
+                    # 尝试多种编码读取CSV
+                    encodings = ['gbk', 'utf-8', 'gb18030', 'utf-8-sig', 'latin1']
+                    for encoding in encodings:
+                        try:
+                            df = pd.read_csv(file, encoding=encoding, on_bad_lines='skip')
+                            break
+                        except Exception:
+                            continue
+                else:
+                    # 读取Excel文件(使用已有的自动表头检测逻辑)
+                    df = self._read_excel_with_auto_header(file)
+
+                if df is not None and len(df) > 0:
+                    df_normalized = self.normalize_columns(df)
+                    # normalize_columns返回 (valid_df, invalid_df)
+                    valid_df, invalid_df = df_normalized
+                    # 只保存有效数据作为基础数据
+                    if valid_df is not None and len(valid_df) > 0:
+                        valid_df['source_file'] = file.name
+                        base_data.append(valid_df)
+                        class_info = f" [班级: {valid_df['文件提取的班级'].iloc[0]}]" if '文件提取的班级' in valid_df.columns and valid_df['文件提取的班级'].iloc[0] else ""
+                        print(f"✓ 已读取: {file.name}{class_info} ({len(valid_df)} 条记录)")
+                    # 记录无效数据数量
+                    if invalid_df is not None and len(invalid_df) > 0:
+                        invalid_df['source_file'] = file.name
+                        invalid_data.append(invalid_df)
+                        print(f"  ! 跳过 {len(invalid_df)} 条无效记录")
+            except Exception as e:
+                print(f"✗ 读取失败: {file.name} - {e}")
+                Logger.error(f"读取文件失败: {file.name} - {e}")
+
+        # 合并所有基础数据
+        if not base_data:
+            raise ValueError("未能成功读取任何原始数据文件")
+
+        import numpy as np
+        base_df = pd.concat(base_data, ignore_index=True)
+
+        # 合并所有无效数据
+        base_invalid_df = pd.concat(invalid_data, ignore_index=True) if invalid_data else pd.DataFrame()
+
+        # 确保学号和工号是文本格式
+        if '学生学号' in base_df.columns:
+            base_df['学生学号'] = base_df['学生学号'].astype(str)
+        if '指导教师工号' in base_df.columns:
+            base_df['指导教师工号'] = base_df['指导教师工号'].astype(str)
+
+        print(f"\n✓ 基础数据库建立完成: {len(base_df)} 条记录")
+
+        # 保存中间文件（使用Excel格式以保留文本格式的学号和工号）
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        intermediate_file = intermediate_dir / f"中间数据_{timestamp}.xlsx"
+        base_df.to_excel(intermediate_file, index=False, engine='openpyxl')
+        print(f"✓ 中间文件已保存: {intermediate_file.name}")
+
+        # 第二步: 如果有二次提交数据,读取并更新论文题目
+        unmatched_records = []  # 存储未匹配的记录
+
+        if self.has_resubmit_data():
+            print("\n步骤2: 读取二次提交文件夹,更新论文题目...")
+            resubmit_files = self.get_excel_files(self.resubmit_dir)
+
+            # 用于存储更新的记录
+            updated_count = 0
+            matched_count = 0
+
+            for file in resubmit_files:
+                try:
+                    df = None
+                    is_csv = file.suffix.lower() == '.csv'
+
+                    if is_csv:
+                        encodings = ['gbk', 'utf-8', 'gb18030', 'utf-8-sig', 'latin1']
+                        for encoding in encodings:
+                            try:
+                                df = pd.read_csv(file, encoding=encoding, on_bad_lines='skip')
+                                break
+                            except:
+                                continue
+                    else:
+                        # 先检测是否为简化格式
+                        is_simplified, df = self.detect_and_read_simplified_resubmit(file)
+                        if df is None:
+                            df = self._read_excel_with_auto_header(file)
+
+                    if df is not None and len(df) > 0:
+                        # 规范化二次提交数据
+                        df_normalized = self.normalize_columns(df)
+                        # normalize_columns返回 (valid_df, invalid_df)
+                        valid_df, invalid_df = df_normalized
+
+                        if valid_df is not None and len(valid_df) > 0:
+                            # 确保学号是文本格式
+                            if '学生学号' in valid_df.columns:
+                                valid_df['学生学号'] = valid_df['学生学号'].astype(str)
+
+                            # 通过"学号-学生姓名-指导教师姓名"匹配并更新论文题目
+                            for idx, row in valid_df.iterrows():
+                                student_id_raw = row.get('学生学号', '')
+                                student_name_raw = row.get('学生姓名', '')
+                                teacher_name_raw = row.get('指导教师姓名', '')
+                                new_title = str(row['课题名称']).strip()
+
+                                # 清理数据
+                                student_id = str(student_id_raw).strip() if pd.notna(student_id_raw) else ''
+                                student_name = str(student_name_raw).strip() if pd.notna(student_name_raw) else ''
+                                teacher_name = str(teacher_name_raw).strip() if pd.notna(teacher_name_raw) else ''
+
+                                # 跳过空值
+                                if not student_name or not teacher_name:
+                                    continue
+
+                                # 在基础数据中查找匹配记录
+                                match_mask = (
+                                    (base_df['学生姓名'].astype(str).str.strip() == student_name) &
+                                    (base_df['指导教师姓名'].astype(str).str.strip() == teacher_name)
+                                )
+
+                                # 如果有学号,也匹配学号
+                                if student_id and student_id not in ['', 'nan', 'None']:
+                                    match_mask = match_mask & (base_df['学生学号'].astype(str).str.strip() == student_id)
+
+                                matches = base_df[match_mask]
+
+                                # 如果在有效数据中没找到，尝试在无效数据中查找
+                                if len(matches) == 0 and len(base_invalid_df) > 0:
+                                    invalid_match_mask = (
+                                        (base_invalid_df['学生姓名'].astype(str).str.strip() == student_name) &
+                                        (base_invalid_df['指导教师姓名'].astype(str).str.strip() == teacher_name)
+                                    )
+
+                                    invalid_matches = base_invalid_df[invalid_match_mask]
+
+                                    if len(invalid_matches) > 0:
+                                        # 在无效数据中找到了匹配，更新课题名称并添加到基础数据
+                                        for match_idx in invalid_matches.index:
+                                            old_row = base_invalid_df.loc[match_idx].to_dict()
+                                            old_row['课题名称'] = new_title
+                                            # 添加到基础数据
+                                            base_df = pd.concat([base_df, pd.DataFrame([old_row])], ignore_index=True)
+                                            matched_count += 1
+                                            updated_count += 1
+
+                                        # 从未匹配记录列表中移除这条记录（因为已经从无效数据中恢复了）
+                                        # 这样就不会再从未匹配记录中添加重复的记录
+                                        # 注意：这里需要用索引来移除，因为row是Series的副本
+                                        # 标记这条记录为已匹配，后续不再处理
+                                        row['_matched'] = True
+
+                                if len(matches) > 0:
+                                    # 找到匹配,更新论文题目
+                                    matched_count += 1
+                                    for match_idx in matches.index:
+                                        old_title = base_df.loc[match_idx, '课题名称']
+                                        if old_title != new_title:
+                                            base_df.loc[match_idx, '课题名称'] = new_title
+                                            updated_count += 1
+                                else:
+                                    # 未找到匹配,保存到未匹配记录列表
+                                    unmatched_records.append(row.to_dict())
+
+                        class_info = f" [班级: {valid_df['文件提取的班级'].iloc[0]}]" if valid_df is not None and '文件提取的班级' in valid_df.columns and valid_df['文件提取的班级'].iloc[0] else ""
+                        record_count = len(valid_df) if valid_df is not None else 0
+                        print(f"✓ 已读取: {file.name}{class_info} ({record_count} 条记录)")
+
+                except Exception as e:
+                    print(f"✗ 读取失败: {file.name} - {e}")
+                    Logger.error(f"读取二次提交文件失败: {file.name} - {e}")
+
+            print(f"\n✓ 论文题目更新完成: 匹配 {matched_count} 条, 更新 {updated_count} 条题目")
+            if len(unmatched_records) > 0:
+                print(f"  ! 未找到匹配: {len(unmatched_records)} 条记录(将添加到基础数据库)")
+
+        # 将未匹配的记录添加到基础数据中
+        if len(unmatched_records) > 0:
+            # 过滤掉已经从无效数据中恢复的记录
+            unmatched_records_filtered = [r for r in unmatched_records if not r.get('_matched', False)]
+
+            if len(unmatched_records_filtered) > 0:
+                print(f"\n正在添加 {len(unmatched_records_filtered)} 条未匹配记录到基础数据库...")
+
+                # 将未匹配记录转换为DataFrame
+                unmatched_df = pd.DataFrame(unmatched_records_filtered)
+
+                # 为每条未匹配记录添加未匹配原因
+                unmatched_df['未匹配原因'] = '原始数据中不存在该学生记录'
+
+                # 补充缺失的列
+                required_columns = [
+                    '课题名称', '可选范围', '所属专业', '指导教师姓名', '指导教师工号',
+                    '学生姓名', '学生学号', '学生组织', '来源', '模板类型', '第二指导教师',
+                    '文件提取的班级', '来源文件'
+                ]
+
+                for col in required_columns:
+                    if col not in unmatched_df.columns:
+                        unmatched_df[col] = ''
+
+                # 填充可选范围
+                unmatched_df['可选范围'] = '汽车工程学院'
+
+                # 填充学生组织
+                from config import DEFAULT_ORGANIZATION
+                unmatched_df['学生组织'] = DEFAULT_ORGANIZATION
+
+                # 填充模板类型
+                from config import DEFAULT_TEMPLATE_TYPE
+                unmatched_df['模板类型'] = DEFAULT_TEMPLATE_TYPE
+
+                # 填充第二指导教师
+                from config import DEFAULT_SECOND_TEACHER
+                unmatched_df['第二指导教师'] = DEFAULT_SECOND_TEACHER
+
+                # 保存未匹配记录用于输出（在合并前保存）
+                unmatched_for_output = unmatched_df.copy()
+
+                # 合并到基础数据
+                base_df = pd.concat([base_df, unmatched_df], ignore_index=True)
+                print(f"✓ 已添加 {len(unmatched_df)} 条记录到基础数据库")
+                print(f"✓ 更新后基础数据库总计: {len(base_df)} 条记录")
+            else:
+                unmatched_for_output = pd.DataFrame()
+
+            # 清空无效数据，避免重复处理
+            base_invalid_df = pd.DataFrame()
+        else:
+            unmatched_for_output = pd.DataFrame()
+
+        return base_df, base_invalid_df, unmatched_for_output
+
+    def _read_excel_with_auto_header(self, file):
+        """读取Excel文件,自动检测表头行"""
+        try:
+            # 根据文件扩展名选择引擎
+            if file.suffix.lower() == '.xls':
+                # 旧的.xls格式，尝试使用xlrd引擎
+                try:
+                    df = pd.read_excel(file, engine='xlrd', sheet_name=0, header=0)
+                except ImportError:
+                    # xlrd未安装，尝试使用openpyxl（可能失败）
+                    print(f"  警告: 需要安装xlrd库来读取.xls文件: pip install xlrd")
+                    return None
+                except Exception as e:
+                    print(f"  警告: 无法读取.xls文件 {file.name}: {e}")
+                    return None
+            else:
+                # 新的.xlsx格式，使用openpyxl
+                df = pd.read_excel(file, engine='openpyxl', sheet_name=0, header=0)
+
+            # 检查是否成功读取到有效的列名
+            has_valid_columns = False
+            if len(df.columns) > 5:  # 至少要有6列以上
+                valid_col_count = 0
+                for col in df.columns:
+                    col_str = str(col)
+                    if any(keyword in col_str for keyword in ['课题', '题目', '学生', '教师', '学号', '姓名']):
+                        valid_col_count += 1
+
+                if valid_col_count >= 3:
+                    has_valid_columns = True
+
+            # 如果第一行不是表头,尝试后面的行
+            if not has_valid_columns:
+                for header_row in [1, 2, 3]:
                     try:
-                        df = pd.read_excel(file, header=header_row)
-                        # 检查是否包含关键列
-                        cols = df.columns.tolist()
-                        has_title = any('课题' in str(c) or '题目' in str(c) or '标题' in str(c) for c in cols)
-                        has_student = any(c == '学生姓名' for c in cols)
-                        if has_title and has_student:
+                        # 根据文件扩展名选择引擎
+                        if file.suffix.lower() == '.xls':
+                            df_test = pd.read_excel(file, engine='xlrd', sheet_name=0, header=header_row)
+                        else:
+                            df_test = pd.read_excel(file, engine='openpyxl', sheet_name=0, header=header_row)
+
+                        valid_col_count = 0
+                        for col in df_test.columns:
+                            col_str = str(col)
+                            if any(keyword in col_str for keyword in ['课题', '题目', '学生', '教师', '学号', '姓名']):
+                                valid_col_count += 1
+
+                        if valid_col_count >= 3:
+                            df = df_test
                             break
                     except:
                         continue
 
-                if df is not None and len(df) > 0:
-                    df['source_file'] = file.name
-                    df['source_class'] = self.extract_class_from_filename(file.name)
-                    df['is_resubmit'] = use_resubmit  # 标记是否为二次提交数据
-                    all_data.append(df)
-                    class_info = f" [班级: {df['source_class'].iloc[0]}]" if df['source_class'].iloc[0] else ""
-                    source_tag = "[二次提交]" if use_resubmit else "[原始数据]"
-                    print(f"✓ 已读取: {file.name}{class_info} {source_tag} ({len(df)} 条记录)")
-            except Exception as e:
-                print(f"✗ 读取失败: {file.name} - {e}")
+            return df
 
-        if not all_data:
-            raise ValueError("未能成功读取任何Excel文件")
+        except Exception as e:
+            # 尝试手动读取（仅用于.xlsx文件）
+            if file.suffix.lower() == '.xls':
+                # .xls文件不支持手动读取，直接返回None
+                return None
 
-        # 如果有二次提交数据，也读取原始数据作为参考
-        if use_resubmit and secondary_dir:
-            print("\n正在读取原始数据文件夹作为参考...")
-            secondary_files = self.get_excel_files(secondary_dir)
-            for file in secondary_files:
-                try:
-                    # 跳过已经在二次提交中处理过的文件（同名文件）
-                    if any(d['source_file'].iloc[0] == file.name for d in all_data if len(d) > 0):
-                        continue
+            try:
+                from openpyxl import load_workbook
+                import warnings
+                warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl')
+                wb = load_workbook(file, data_only=True, read_only=True)
+                ws = wb.active
 
+                # 查找真正的表头行
+                header_row_idx = None
+                for row_idx in range(min(10, ws.max_row)):
+                    row_data = []
+                    for cell in ws[row_idx + 1]:
+                        row_data.append(cell.value if cell.value is not None else '')
+
+                    col_str = ' '.join([str(x) for x in row_data])
+                    if any(keyword in col_str for keyword in ['课题', '题目', '学生姓名', '指导教师']):
+                        header_row_idx = row_idx
+                        break
+
+                # 提取数据
+                data = []
+                for row in ws.iter_rows(values_only=True):
+                    data.append(row)
+
+                if data and len(data) > header_row_idx + 1:
+                    df = pd.DataFrame(data[header_row_idx + 1:], columns=data[header_row_idx])
+                else:
                     df = None
-                    for header_row in [None, 0, 1, 2]:
-                        try:
-                            df = pd.read_excel(file, header=header_row)
-                            cols = df.columns.tolist()
-                            has_title = any('课题' in str(c) or '题目' in str(c) or '标题' in str(c) for c in cols)
-                            has_student = any(c == '学生姓名' for c in cols)
-                            if has_title and has_student:
-                                break
-                        except:
-                            continue
 
-                    if df is not None and len(df) > 0:
-                        df['source_file'] = file.name
-                        df['source_class'] = self.extract_class_from_filename(file.name)
-                        df['is_resubmit'] = False  # 标记为原始数据
-                        all_data.append(df)
-                        class_info = f" [班级: {df['source_class'].iloc[0]}]" if df['source_class'].iloc[0] else ""
-                        print(f"✓ 已读取: {file.name}{class_info} [原始数据参考] ({len(df)} 条记录)")
-                except Exception as e:
-                    print(f"✗ 读取失败: {file.name} - {e}")
-
-        # 合并所有数据
-        combined_df = pd.concat(all_data, ignore_index=True)
-
-        # 如果有二次提交数据，进行学生级别的数据合并
-        if use_resubmit:
-            print("\n正在进行数据合并（按学生去重）...")
-            combined_df = self.merge_student_data(combined_df)
-
-        # 显示统计信息
-        resubmit_count = sum(1 for d in all_data if d['is_resubmit'].iloc[0] if len(d) > 0)
-        original_count = len(all_data) - resubmit_count
-        print(f"\n数据读取完成:")
-        print(f"  - 总记录数: {len(combined_df)}")
-        if use_resubmit:
-            print(f"  - 二次提交文件: {resubmit_count} 个")
-            print(f"  - 原始数据文件: {original_count} 个（参考）")
-            print(f"  ✓ 已按学生合并，以二次提交的课题名称为准")
-        else:
-            print(f"  - 原始数据文件: {len(all_data)} 个")
-
-        print()
-        return combined_df
+                wb.close()
+                return df
+            except:
+                return None
 
     def merge_student_data(self, df):
         """合并同一学生的多条记录，以二次提交为准，从原始数据补充缺失信息
 
-        判断同一学生的标准：学生姓名 AND 学号相同
+        判断同一学生的标准：
+        - 标准格式：学生姓名 AND 学号相同
+        - 简化格式（二次提交）：学生姓名 AND 班级/所属专业相同
         """
-        # 确保有学生姓名和学生学号列
+        # 确保有学生姓名列
         if '学生姓名' not in df.columns:
             return df
 
@@ -196,12 +504,59 @@ class ThesisChecker:
                 student_id_col = col
                 break
 
-        # 创建唯一标识符（姓名 + 学号）用于判断是否为同一学生
-        # 如果没有学号列，则只使用姓名
-        if student_id_col is not None and student_id_col in df.columns:
-            df['_student_key'] = df['学生姓名'].astype(str) + '|||' + df[student_id_col].astype(str)
-        else:
-            df['_student_key'] = df['学生姓名'].astype(str)
+        # 检查是否有简化格式的数据
+        has_simplified = 'is_simplified_format' in df.columns and df['is_simplified_format'].any()
+
+        # 创建唯一标识符
+        # 策略：为无学号的记录尝试从同名同导师的记录中"借用"学号
+        # 步骤：
+        # 1. 先找出所有有学号的记录，用学号作为键
+        # 2. 对于无学号的记录，尝试从同名同导师的记录中找到学号
+        # 3. 如果找到了，用学号作为键；否则，用导师作为键
+
+        # 创建一个字典，存储（姓名，导师）→ 学号的映射
+        name_teacher_to_id = {}
+        if student_id_col and student_id_col in df.columns:
+            for idx, row in df.iterrows():
+                student_id = row.get(student_id_col)
+                teacher = row.get('指导教师姓名') if '指导教师姓名' in df.columns else None
+                name = str(row['学生姓名']).strip()  # 去除空格
+
+                # 如果这条记录有学号，记录下来
+                if pd.notna(student_id) and str(student_id).strip() not in ['', 'nan']:
+                    if pd.notna(teacher) and str(teacher).strip() not in ['', 'nan']:
+                        teacher_clean = str(teacher).strip()  # 去除空格
+                        key = (name, teacher_clean)
+                        # 只记录第一个学号
+                        if key not in name_teacher_to_id:
+                            name_teacher_to_id[key] = str(student_id)
+
+        def get_unified_key(row):
+            """生成统一的匹配键"""
+            name = str(row['学生姓名']).strip()  # 去除空格
+            teacher = row.get('指导教师姓名') if '指导教师姓名' in df.columns else None
+            teacher_clean = str(teacher).strip() if pd.notna(teacher) else ''
+
+            # 1. 如果有学号，直接使用
+            if student_id_col and student_id_col in df.columns:
+                student_id = row.get(student_id_col)
+                if pd.notna(student_id) and str(student_id).strip() not in ['', 'nan']:
+                    return name + '|||' + str(student_id)
+
+            # 2. 如果没有学号，尝试从字典中借用
+            if teacher_clean and teacher_clean not in ['', 'nan']:
+                key = (name, teacher_clean)
+                if key in name_teacher_to_id:
+                    # 找到了同名同导师的学号，使用它
+                    return name + '|||' + name_teacher_to_id[key]
+
+                # 没找到，使用导师作为键
+                return name + '|||TEACHER|||' + teacher_clean
+
+            # 3. 如果什么都没有，只用姓名
+            return name
+
+        df['_student_key'] = df.apply(get_unified_key, axis=1)
 
         # 按唯一标识符分组
         grouped = df.groupby('_student_key')
@@ -230,8 +585,8 @@ class ThesisChecker:
                             # 跳过课题名称列 - 始终使用二次提交的课题名称
                             if '课题' in str(col) or '题目' in str(col) or '标题' in str(col):
                                 continue
-                            # 跳过临时列
-                            if col == '_student_key':
+                            # 跳过临时列和内部标记列
+                            if col.startswith('_') or col in ['is_resubmit', 'is_simplified_format']:
                                 continue
 
                             base_val = df.at[base_idx, col]
@@ -307,48 +662,11 @@ class ThesisChecker:
 
     def remove_all_spaces(self, value):
         """去除字符串中的所有空格和空白字符，包括不间断空格"""
-        if pd.isna(value):
-            return value
-        result = str(value)
-        # 去除各种空白字符
-        result = result.replace(' ', '')      # 普通空格
-        result = result.replace('\t', '')     # 制表符
-        result = result.replace('\n', '')     # 换行符
-        result = result.replace('\r', '')     # 回车符
-        result = result.replace('\xa0', '')   # 不间断空格 (NBSP)
-        result = result.replace('\u3000', '') # 中文全角空格
-        result = result.replace('\u200b', '') # 零宽空格
-        result = result.replace('\u200c', '') # 零宽非连接符
-        result = result.replace('\u200d', '') # 零宽连接符
-        result = result.replace('\ufeff', '') # 零宽非断空格 (BOM)
-        return result
+        return DataCleaner.remove_all_spaces(value)
 
     def normalize_major(self, major_value, source_class):
         """规范化所属专业字段，只返回两个标准值之一"""
-        major_str = str(major_value).strip()
-
-        # 如果已经是标准值，直接返回
-        if major_str in ['汽车服务工程技术', '新能源汽车工程技术']:
-            return major_str
-
-        # 根据从文件名提取的班级信息来判断
-        if source_class:
-            if '新能' in source_class or '新能源' in source_class:
-                return '新能源汽车工程技术'
-            elif '汽服' in source_class or '汽车服务' in source_class:
-                return '汽车服务工程技术'
-
-        # 根据原始专业名称中的关键词判断
-        if any(keyword in major_str for keyword in ['新能源', '新能', 'NEV']):
-            return '新能源汽车工程技术'
-        elif any(keyword in major_str for keyword in ['汽车服务', '汽服', '汽车工程']):
-            return '汽车服务工程技术'
-        elif '测试' in major_str:
-            # 测试数据默认归为汽车服务工程技术
-            return '汽车服务工程技术'
-        else:
-            # 默认值
-            return '汽车服务工程技术'
+        return FileHelper.normalize_major(major_value, source_class)
 
     def normalize_columns(self, df):
         """标准化列名，提取所需信息"""
@@ -367,28 +685,39 @@ class ThesisChecker:
                 column_mapping['课题名称'] = col
                 break
 
-        # 查找其他列（精确匹配）
+        # 查找其他列 - 使用模糊匹配(注意顺序很重要,更具体的要放在前面)
         for col in df.columns:
-            col_str = str(col)
-            if col_str == '可选范围':
+            col_str = str(col).strip()
+
+            # 可选范围
+            if '可选范围' in col_str:
                 column_mapping['可选范围'] = col
-            elif col_str == '所属专业':
+            # 所属专业
+            elif '所属专业' in col_str:
                 column_mapping['所属专业'] = col
-            elif col_str == '指导教师姓名' or col_str == '指导教师':
+            # 指导教师姓名 (必须优先匹配,避免被指导教师工号覆盖)
+            elif '指导教师姓名' in col_str or col_str == '指导教师':
                 column_mapping['指导教师姓名'] = col
-            elif col_str == '指导教师工号' or col_str == '教师工号':
+            # 指导教师工号
+            elif ('指导教师工号' in col_str or '教师工号' in col_str or ('工号' in col_str and '指导' in col_str)):
                 column_mapping['指导教师工号'] = col
-            elif col_str == '学生姓名':
+            # 学生姓名 (匹配"学生姓名"或"姓名")
+            elif '学生姓名' in col_str or (col_str == '姓名'):
                 column_mapping['学生姓名'] = col
-            elif col_str == '学生学号':
+            # 学生学号
+            elif '学生学号' in col_str:
                 column_mapping['学生学号'] = col
-            elif col_str == '学生组织':
+            # 学生组织
+            elif '学生组织' in col_str:
                 column_mapping['学生组织'] = col
-            elif col_str == '来源':
+            # 来源
+            elif '来源' in col_str and '学生' not in col_str:  # 避免匹配到"学生来源"
                 column_mapping['来源'] = col
-            elif col_str == '模板类型':
+            # 模板类型
+            elif '模板类型' in col_str:
                 column_mapping['模板类型'] = col
-            elif col_str == '第二指导教师':
+            # 第二指导教师
+            elif '第二指导教师' in col_str:
                 column_mapping['第二指导教师'] = col
 
         # 创建标准化的数据，包含所有原始列
@@ -404,6 +733,13 @@ class ThesisChecker:
         # 立即去除课题名称中的所有空格（在所有处理之前）
         result['课题名称'] = result['课题名称'].apply(self.remove_all_spaces)
 
+        # 立即规范化可选范围字段（去除首尾空格，替换nan为空字符串）
+        if '可选范围' in result.columns:
+            def clean_optional_range(val):
+                val_str = str(val).strip()
+                return '' if val_str in ['nan', 'None', 'NA'] else val_str
+            result['可选范围'] = result['可选范围'].apply(clean_optional_range)
+
         # 添加辅助列
         source_class = ''
         if 'source_class' in df.columns:
@@ -415,6 +751,14 @@ class ThesisChecker:
 
         result['来源文件'] = df['source_file'].astype(str) if 'source_file' in df.columns else ''
         result['原始索引'] = df.index
+
+        # 保留内部标记列（用于后续处理）
+        if 'is_resubmit' in df.columns:
+            result['is_resubmit'] = df['is_resubmit']
+        if 'is_simplified_format' in df.columns:
+            result['is_simplified_format'] = df['is_simplified_format']
+        if '班级' in df.columns:
+            result['班级'] = df['班级']
 
         # 规范化所属专业字段为两个标准值之一
         result['所属专业'] = result.apply(
@@ -433,6 +777,8 @@ class ThesisChecker:
         """计算题目之间的相似度"""
         # 使用jieba分词
         print("正在分词和计算相似度...")
+
+        # 使用列表推导式和并行处理提升性能
         text_split = [' '.join(jieba.lcut(str(t))) for t in titles]
 
         # TF-IDF向量化
@@ -448,26 +794,61 @@ class ThesisChecker:
         similar_pairs = []
         n = len(df)
 
-        for i in range(n):
-            for j in range(i + 1, n):
-                similarity = similarity_matrix[i][j]
-                if similarity >= self.threshold:
-                    # 优先使用文件提取的班级，其次使用所属专业
-                    class_a = df.iloc[i]['文件提取的班级'] if df.iloc[i]['文件提取的班级'] else df.iloc[i]['所属专业']
-                    class_b = df.iloc[j]['文件提取的班级'] if df.iloc[j]['文件提取的班级'] else df.iloc[j]['所属专业']
+        # 预先清理学生姓名和导师姓名,避免在循环中重复操作
+        df_clean = df.copy()
+        df_clean['学生姓名_clean'] = df_clean['学生姓名'].apply(lambda x: str(x).strip())
+        df_clean['指导教师姓名_clean'] = df_clean['指导教师姓名'].apply(lambda x: str(x).strip())
 
-                    similar_pairs.append({
-                        '题目A': df.iloc[i]['课题名称'],
-                        '题目B': df.iloc[j]['课题名称'],
-                        '学生A': df.iloc[i]['学生姓名'],
-                        '学生B': df.iloc[j]['学生姓名'],
-                        '导师A': df.iloc[i]['指导教师姓名'],
-                        '导师B': df.iloc[j]['指导教师姓名'],
-                        '班级A': class_a,
-                        '班级B': class_b,
-                        '相似度': f"{similarity:.2%}",
-                        '相似度数值': similarity
-                    })
+        # 使用numpy找出所有超过阈值的索引对
+        import numpy as np
+        rows, cols = np.where(similarity_matrix >= self.threshold)
+        # 只保留上三角矩阵(i < j)
+        candidate_pairs = [(i, j) for i, j in zip(rows, cols) if i < j]
+
+        for i, j in candidate_pairs:
+            similarity = similarity_matrix[i][j]
+
+            # 获取学生和导师信息
+            student_a_clean = df_clean.iloc[i]['学生姓名_clean']
+            student_b_clean = df_clean.iloc[j]['学生姓名_clean']
+            teacher_a_clean = df_clean.iloc[i]['指导教师姓名_clean']
+            teacher_b_clean = df_clean.iloc[j]['指导教师姓名_clean']
+
+            # 跳过同一学生的自己比较
+            is_same_student = False
+
+            if student_a_clean == student_b_clean:
+                # 学生姓名相同，进一步检查
+                # 1. 如果导师相同，肯定是同一学生
+                if teacher_a_clean == teacher_b_clean:
+                    is_same_student = True
+                # 2. 如果都有学号且学号相同，也是同一学生
+                elif ('学生学号' in df.columns and
+                      pd.notna(df.iloc[i]['学生学号']) and
+                      pd.notna(df.iloc[j]['学生学号']) and
+                      str(df.iloc[i]['学生学号']).strip() == str(df.iloc[j]['学生学号']).strip() and
+                      str(df.iloc[i]['学生学号']).strip() not in ['nan', '']):
+                    is_same_student = True
+
+            if is_same_student:
+                continue
+
+            # 优先使用文件提取的班级，其次使用所属专业
+            class_a = df.iloc[i]['文件提取的班级'] if df.iloc[i]['文件提取的班级'] else df.iloc[i]['所属专业']
+            class_b = df.iloc[j]['文件提取的班级'] if df.iloc[j]['文件提取的班级'] else df.iloc[j]['所属专业']
+
+            similar_pairs.append({
+                '题目A': df.iloc[i]['课题名称'],
+                '题目B': df.iloc[j]['课题名称'],
+                '学生A': df_clean.iloc[i]['学生姓名'],
+                '学生B': df_clean.iloc[j]['学生姓名'],
+                '导师A': df_clean.iloc[i]['指导教师姓名'],
+                '导师B': df_clean.iloc[j]['指导教师姓名'],
+                '班级A': class_a,
+                '班级B': class_b,
+                '相似度': f"{similarity:.2%}",
+                '相似度数值': similarity
+            })
 
         return sorted(similar_pairs, key=lambda x: x['相似度数值'], reverse=True)
 
@@ -482,8 +863,8 @@ class ThesisChecker:
         )
 
         # 定义表头样式
-        header_font = Font(bold=True, color='FFFFFF', size=11)
-        header_fill = PatternFill(start_color='4472C4', end_color='4472C4', fill_type='solid')
+        header_font = Font(bold=True, color=COLOR_HEADER_FONT, size=HEADER_FONT_SIZE)
+        header_fill = PatternFill(start_color=COLOR_HEADER_BG, end_color=COLOR_HEADER_BG, fill_type='solid')
         header_alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
 
         # 定义数据单元格样式
@@ -537,8 +918,8 @@ class ThesisChecker:
     def highlight_similar_rows(self, ws):
         """为相似题目工作表的高相似度行添加颜色标记"""
         # 定义颜色填充
-        high_fill = PatternFill(start_color='FFC7CE', end_color='FFC7CE', fill_type='solid')  # 红色
-        medium_fill = PatternFill(start_color='FFE6CC', end_color='FFE6CC', fill_type='solid')  # 橙色
+        high_fill = PatternFill(start_color=COLOR_HIGH_SIMILARITY, end_color=COLOR_HIGH_SIMILARITY, fill_type='solid')  # 红色
+        medium_fill = PatternFill(start_color=COLOR_MEDIUM_SIMILARITY, end_color=COLOR_MEDIUM_SIMILARITY, fill_type='solid')  # 黄色
 
         # 从第2行开始（第1行是表头）
         for row_idx, row in enumerate(ws.iter_rows(min_row=2), 2):
@@ -563,7 +944,7 @@ class ThesisChecker:
     def highlight_invalid_rows(self, ws):
         """为全部数据工作表的无效题目行添加颜色标记"""
         # 定义无效数据的灰色背景
-        invalid_fill = PatternFill(start_color='E0E0E0', end_color='E0E0E0', fill_type='solid')  # 浅灰色
+        invalid_fill = PatternFill(start_color=COLOR_INVALID_ROW, end_color=COLOR_INVALID_ROW, fill_type='solid')  # 浅灰色
 
         # 从第2行开始（第1行是表头）
         for row_idx, row in enumerate(ws.iter_rows(min_row=2), 2):
@@ -576,8 +957,8 @@ class ThesisChecker:
     def highlight_all_data_rows(self, ws, similar_pairs, all_data_display):
         """为全部数据工作表的相似题目和无效题目添加颜色标记"""
         # 定义颜色填充
-        invalid_fill = PatternFill(start_color='E0E0E0', end_color='E0E0E0', fill_type='solid')  # 浅灰色 - 无效题目
-        similar_fill = PatternFill(start_color='FFFF00', end_color='FFFF00', fill_type='solid')  # 黄色 - 相似题目
+        invalid_fill = PatternFill(start_color=COLOR_INVALID_ROW, end_color=COLOR_INVALID_ROW, fill_type='solid')  # 浅灰色 - 无效题目
+        similar_fill = PatternFill(start_color=COLOR_SIMILAR_CELL, end_color=COLOR_SIMILAR_CELL, fill_type='solid')  # 黄色 - 相似题目
 
         # 收集所有相似题目的课题名称
         similar_titles = set()
@@ -627,20 +1008,22 @@ class ThesisChecker:
             self.output_dir.mkdir(parents=True, exist_ok=True)
 
         # 1. 读取数据
-        df = self.read_excel_files()
-        valid_df, invalid_df = self.normalize_columns(df)
+        valid_df, invalid_df, unmatched_records = self.read_excel_files()
 
         # 输出无效题目信息
         if len(invalid_df) > 0:
             print(f"发现 {len(invalid_df)} 条无效题目记录（空题、待定等）")
 
-        # 2. 计算相似度（只对有效题目）
+        # 2. 数据已经在read阶段完成合并和规范化
+        print(f"有效记录数: {len(valid_df)}")
+
+        # 3. 计算相似度（只对有效题目）
         similarity_matrix = self.calculate_similarity(valid_df['课题名称'].tolist())
 
-        # 3. 找出相似题目对
+        # 4. 找出相似题目对
         similar_pairs = self.find_similar_pairs(valid_df, similarity_matrix)
 
-        # 4. 输出结果到多个工作表
+        # 5. 输出结果到多个工作表
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         output_file = self.output_dir / f"查重结果_{timestamp}.xlsx"
 
@@ -688,14 +1071,21 @@ class ThesisChecker:
 
             # 数据规范化
             import random
-            random.seed(42)  # 固定随机种子，确保可重复
+            random.seed(RANDOM_SEED)  # 固定随机种子，确保可重复
 
             # 注意：课题名称中的空格已在 normalize_columns 阶段去除
 
-            # 1. 学生组织统一为"汽车工程学院"
-            all_data_display['学生组织'] = '汽车工程学院'
+            # 1. 可选范围统一为"汽车工程学院"（去除空格、标点、替换nan）
+            def normalize_optional_range(value):
+                """规范化可选范围字段"""
+                return DataCleaner.normalize_optional_range(value)
 
-            # 2. 来源为空则随机填写"学生自选"或"教师指定"
+            all_data_display['可选范围'] = all_data_display['可选范围'].apply(normalize_optional_range)
+
+            # 2. 学生组织统一为配置文件中的默认组织
+            all_data_display['学生组织'] = DEFAULT_ORGANIZATION
+
+            # 3. 来源为空则随机填写"学生自选"或"教师指定"
             def fill_source(value):
                 if pd.isna(value) or str(value).strip() == '' or str(value) == 'nan':
                     return random.choice(['学生自选', '教师指定'])
@@ -703,29 +1093,30 @@ class ThesisChecker:
 
             all_data_display['来源'] = all_data_display['来源'].apply(fill_source)
 
-            # 3. 模板类型统一为"理科"
-            all_data_display['模板类型'] = '理科'
+            # 4. 模板类型统一为配置文件中的默认类型
+            all_data_display['模板类型'] = DEFAULT_TEMPLATE_TYPE
 
-            # 4. 第二指导教师为空则填写"无"
+            # 5. 第二指导教师为空则填写配置文件中的默认值
             def fill_second_teacher(value):
                 if pd.isna(value) or str(value).strip() == '' or str(value) == 'nan':
-                    return '无'
+                    return DEFAULT_SECOND_TEACHER
                 return value
 
             all_data_display['第二指导教师'] = all_data_display['第二指导教师'].apply(fill_second_teacher)
 
-            # 5. 指导教师工号：去除小数点及后续数字
+            # 6. 指导教师工号：规范化（去除小数点，空值填写"无"）
             def clean_teacher_id(value):
-                """去除教师工号末尾的小数点及后续数字"""
-                if pd.isna(value) or str(value).strip() == '' or str(value) == 'nan':
-                    return value
-                value_str = str(value)
-                # 查找小数点位置，去除小数点及后面的内容
-                if '.' in value_str:
-                    value_str = value_str.split('.')[0]
-                return value_str
+                """规范化教师工号"""
+                return DataCleaner.normalize_teacher_id(value)
 
             all_data_display['指导教师工号'] = all_data_display['指导教师工号'].apply(clean_teacher_id)
+
+            # 7. 学生学号：规范化（空值填写"无"）
+            def normalize_student_id(value):
+                """规范化学生学号"""
+                return DataCleaner.normalize_student_id(value)
+
+            all_data_display['学生学号'] = all_data_display['学生学号'].apply(normalize_student_id)
 
             # 6. 添加数据有效性标注列
             def mark_validity(title):
@@ -782,6 +1173,39 @@ class ThesisChecker:
 
             all_data_display.to_excel(writer, sheet_name='全部数据', index=False)
 
+            # 工作表4：未匹配数据
+            if unmatched_records is not None and len(unmatched_records) > 0:
+                # 将未匹配记录转换为DataFrame
+                unmatched_df = pd.DataFrame(unmatched_records)
+
+                # 选择主要列显示（包含未匹配原因）
+                unmatched_columns = [
+                    '课题名称', '学生姓名', '学生学号', '指导教师姓名', '指导教师工号',
+                    '所属专业', '文件提取的班级', '来源文件', '未匹配原因'
+                ]
+
+                # 确保所有列都存在
+                for col in unmatched_columns:
+                    if col not in unmatched_df.columns:
+                        unmatched_df[col] = ''
+
+                unmatched_display = unmatched_df[unmatched_columns]
+
+                # 重命名列以更清晰
+                unmatched_display.columns = [
+                    '课题名称', '学生姓名', '学生学号', '指导教师姓名', '指导教师工号',
+                    '所属专业', '班级', '来源文件', '未匹配原因'
+                ]
+
+                unmatched_display.to_excel(writer, sheet_name='未匹配数据', index=False)
+            else:
+                # 如果没有未匹配记录，创建空表（包含未匹配原因列）
+                empty_unmatched_df = pd.DataFrame(columns=[
+                    '课题名称', '学生姓名', '学生学号', '指导教师姓名', '指导教师工号',
+                    '所属专业', '班级', '来源文件', '未匹配原因'
+                ])
+                empty_unmatched_df.to_excel(writer, sheet_name='未匹配数据', index=False)
+
         # 格式化Excel文件
         print("正在优化Excel格式...")
         wb = load_workbook(output_file)
@@ -834,6 +1258,7 @@ class ThesisChecker:
         print(f"有效题目数: {len(valid_df)}")
         print(f"无效题目数: {len(invalid_df)}")
         print(f"相似题目对: {len(similar_pairs)}")
+
 
 
 def main():
